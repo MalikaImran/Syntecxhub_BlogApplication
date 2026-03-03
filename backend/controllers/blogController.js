@@ -1,38 +1,36 @@
 const Blog = require('../models/Blog');
 const { cloudinary } = require('../config/cloudinary');
+const fs = require('fs');
 
-// Helper: upload file to cloudinary based on type
+// ── Upload ANY file (image or video) to Cloudinary ──────────────
 const uploadToCloudinary = async (file) => {
-  const isVideo = file.mimetype.startsWith('video/');
-  const folder  = isVideo ? 'mern-blog/videos' : 'mern-blog/images';
+  const isVideo  = file.mimetype.startsWith('video/');
+  const folder   = isVideo ? 'mern-blog/videos' : 'mern-blog/images';
 
   return new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
+    const uploadStream = cloudinary.uploader.upload_stream(
       {
         folder,
         resource_type: isVideo ? 'video' : 'image',
         ...(isVideo ? {} : { transformation: [{ width: 1200, height: 630, crop: 'limit' }] }),
       },
       (error, result) => {
-        if (error) reject(error);
-        else resolve(result);
+        if (error) return reject(error);
+        resolve(result);
       }
     );
 
-    const fs = require('fs');
     if (file.path) {
-      // Disk storage — file.path exists
-      const fileStream = fs.createReadStream(file.path);
-      fileStream.pipe(stream);
-      fileStream.on('end', () => {
-        // Cleanup temp file
-        fs.unlink(file.path, () => {});
-      });
+      // Disk storage (/tmp/...) — stream the file then delete it
+      const readStream = fs.createReadStream(file.path);
+      readStream.pipe(uploadStream);
+      readStream.on('error', reject);
+      readStream.on('end', () => fs.unlink(file.path, () => {}));
     } else if (file.buffer) {
-      // Memory storage — file.buffer exists
-      stream.end(file.buffer);
+      // Memory storage — push buffer directly
+      uploadStream.end(file.buffer);
     } else {
-      reject(new Error('No file data found'));
+      reject(new Error('No file data available'));
     }
   });
 };
@@ -42,7 +40,7 @@ exports.getBlogs = async (req, res) => {
   try {
     const { search, category, author, sort } = req.query;
     const filter = { status: 'published' };
-    if (search)   filter.title  = { $regex: search, $options: 'i' };
+    if (search)   filter.title    = { $regex: search, $options: 'i' };
     if (category) filter.category = category;
     if (author)   filter.author   = author;
     const sortOption = sort === 'oldest' ? { createdAt: 1 } : { createdAt: -1 };
@@ -62,7 +60,11 @@ exports.getMyBlogs = async (req, res) => {
 // @GET /api/blogs/:id
 exports.getBlog = async (req, res) => {
   try {
-    const blog = await Blog.findById(req.params.id).populate('author', 'name avatar email');
+    const blog = await Blog.findByIdAndUpdate(
+      req.params.id,
+      { $inc: { views: 1 } },
+      { new: true }
+    ).populate('author', 'name avatar email');
     if (!blog) return res.status(404).json({ message: 'Blog not found' });
     res.json(blog);
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -71,8 +73,8 @@ exports.getBlog = async (req, res) => {
 // @POST /api/blogs
 exports.createBlog = async (req, res) => {
   try {
-    console.log('📝 Body:', req.body);
-    console.log('📎 File:', req.file ? `${req.file.originalname} (${req.file.mimetype})` : 'none');
+    console.log('📝 createBlog body:', req.body);
+    console.log('📎 File:', req.file ? `${req.file.originalname} | ${req.file.mimetype} | ${req.file.size} bytes` : 'none');
 
     const { title, content, category, tags, status } = req.body;
     if (!title || !content || !category) {
@@ -93,33 +95,31 @@ exports.createBlog = async (req, res) => {
       mediaType: 'none',
     };
 
-    // Handle file upload
+    // ── Upload image OR video to Cloudinary ──────────────────────
     if (req.file) {
       const isVideo = req.file.mimetype.startsWith('video/');
+      console.log(`⏫ Uploading ${isVideo ? 'VIDEO' : 'IMAGE'} to Cloudinary...`);
+
+      const result = await uploadToCloudinary(req.file);   // ← ALWAYS use this helper
+      console.log('✅ Cloudinary URL:', result.secure_url);
 
       if (isVideo) {
-        // Video: upload directly to cloudinary with resource_type: video
-        console.log('🎥 Uploading video to Cloudinary...');
-        const result = await uploadToCloudinary(req.file);
         blogData.featuredVideo         = result.secure_url;
         blogData.featuredVideoPublicId = result.public_id;
         blogData.mediaType             = 'video';
-        console.log('✅ Video uploaded:', result.secure_url);
       } else {
-        // Image: already handled by CloudinaryStorage middleware
-        blogData.featuredImage         = req.file.path || req.file.secure_url;
-        blogData.featuredImagePublicId = req.file.filename || req.file.public_id;
+        blogData.featuredImage         = result.secure_url;   // ← secure_url, NOT req.file.path
+        blogData.featuredImagePublicId = result.public_id;
         blogData.mediaType             = 'image';
-        console.log('✅ Image uploaded:', blogData.featuredImage);
       }
     }
 
     const blog = await Blog.create(blogData);
     await blog.populate('author', 'name avatar');
-    console.log('✅ Blog saved. Status:', blog.status, '| MediaType:', blog.mediaType);
+    console.log('✅ Saved | status:', blog.status, '| mediaType:', blog.mediaType, '| image:', blog.featuredImage || 'none');
     res.status(201).json(blog);
   } catch (err) {
-    console.error('❌ Create error:', err.message);
+    console.error('❌ createBlog error:', err.message);
     res.status(500).json({ message: err.message });
   }
 };
@@ -134,40 +134,39 @@ exports.updateBlog = async (req, res) => {
     }
 
     const { title, content, category, tags, status } = req.body;
-    if (title)   { blog.title = title.trim(); }
+    if (title)    blog.title    = title.trim();
     if (content) {
       blog.content = content;
-      const plainText = content.replace(/<[^>]*>/g, '');
-      blog.excerpt = plainText.substring(0, 150).trim() + '...';
+      const plain = content.replace(/<[^>]*>/g, '');
+      blog.excerpt = plain.substring(0, 150).trim() + '...';
     }
     if (category) blog.category = category;
     if (tags)   { try { blog.tags = JSON.parse(tags); } catch { blog.tags = []; } }
-    if (status) { blog.status = status.trim(); }
+    if (status)   blog.status   = status.trim();
 
-    // Handle new file upload
+    // ── Replace media ────────────────────────────────────────────
     if (req.file) {
       const isVideo = req.file.mimetype.startsWith('video/');
 
-      // Delete old media from cloudinary
+      // Delete old Cloudinary assets
       if (blog.featuredImagePublicId) {
-        await cloudinary.uploader.destroy(blog.featuredImagePublicId, { resource_type: 'image' });
-        blog.featuredImage         = '';
-        blog.featuredImagePublicId = '';
+        await cloudinary.uploader.destroy(blog.featuredImagePublicId, { resource_type: 'image' }).catch(() => {});
+        blog.featuredImage = ''; blog.featuredImagePublicId = '';
       }
       if (blog.featuredVideoPublicId) {
-        await cloudinary.uploader.destroy(blog.featuredVideoPublicId, { resource_type: 'video' });
-        blog.featuredVideo         = '';
-        blog.featuredVideoPublicId = '';
+        await cloudinary.uploader.destroy(blog.featuredVideoPublicId, { resource_type: 'video' }).catch(() => {});
+        blog.featuredVideo = ''; blog.featuredVideoPublicId = '';
       }
 
+      const result = await uploadToCloudinary(req.file);  // ← same helper
+
       if (isVideo) {
-        const result = await uploadToCloudinary(req.file);
         blog.featuredVideo         = result.secure_url;
         blog.featuredVideoPublicId = result.public_id;
         blog.mediaType             = 'video';
       } else {
-        blog.featuredImage         = req.file.path || req.file.secure_url;
-        blog.featuredImagePublicId = req.file.filename || req.file.public_id;
+        blog.featuredImage         = result.secure_url;   // ← secure_url
+        blog.featuredImagePublicId = result.public_id;
         blog.mediaType             = 'image';
       }
     }
@@ -178,7 +177,7 @@ exports.updateBlog = async (req, res) => {
     await updated.populate('author', 'name avatar');
     res.json(updated);
   } catch (err) {
-    console.error('❌ Update error:', err.message);
+    console.error('❌ updateBlog error:', err.message);
     res.status(500).json({ message: err.message });
   }
 };
@@ -191,12 +190,10 @@ exports.deleteBlog = async (req, res) => {
     if (blog.author.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
-    if (blog.featuredImagePublicId) {
-      await cloudinary.uploader.destroy(blog.featuredImagePublicId, { resource_type: 'image' });
-    }
-    if (blog.featuredVideoPublicId) {
-      await cloudinary.uploader.destroy(blog.featuredVideoPublicId, { resource_type: 'video' });
-    }
+    if (blog.featuredImagePublicId)
+      await cloudinary.uploader.destroy(blog.featuredImagePublicId, { resource_type: 'image' }).catch(() => {});
+    if (blog.featuredVideoPublicId)
+      await cloudinary.uploader.destroy(blog.featuredVideoPublicId, { resource_type: 'video' }).catch(() => {});
     await blog.deleteOne();
     res.json({ message: 'Blog deleted successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -207,11 +204,11 @@ exports.toggleLike = async (req, res) => {
   try {
     const blog = await Blog.findById(req.params.id);
     if (!blog) return res.status(404).json({ message: 'Blog not found' });
-    const userId    = req.user._id.toString();
-    const likeIndex = blog.likes.findIndex(id => id.toString() === userId);
-    if (likeIndex === -1) blog.likes.push(req.user._id);
-    else blog.likes.splice(likeIndex, 1);
+    const uid = req.user._id.toString();
+    const idx = blog.likes.findIndex(id => id.toString() === uid);
+    if (idx === -1) blog.likes.push(req.user._id);
+    else blog.likes.splice(idx, 1);
     await blog.save();
-    res.json({ likes: blog.likes.length, liked: likeIndex === -1 });
+    res.json({ likes: blog.likes.length, liked: idx === -1 });
   } catch (err) { res.status(500).json({ message: err.message }); }
 };
